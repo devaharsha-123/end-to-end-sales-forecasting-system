@@ -1,82 +1,75 @@
 """
 sarima_model.py
-SARIMA forecaster with automatic order selection via AIC grid search.
+SARIMA forecasting model with automatic seasonal configuration.
 """
+
 import warnings
-import itertools
 import numpy as np
 import pandas as pd
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from loguru import logger
 
-from models.base_model import BaseForecaster
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+# ✅ FIXED IMPORT
+from base_model import BaseForecaster
 
 warnings.filterwarnings("ignore")
 
 
 class SARIMAForecaster(BaseForecaster):
-    """
-    Seasonal ARIMA model.
-    - Auto-selects (p,d,q)(P,D,Q,s=52) via AIC on the training set.
-    - s=52 because data is weekly (52 weeks per year).
-    """
 
-    name = "SARIMA"
+    def __init__(
+        self,
+        order=(1, 1, 1),
+        seasonal_order=(1, 1, 1, 52),
+    ):
 
-    # Reduced grid for speed; expand for production hyperparameter search
-    P_RANGE = range(0, 2)
-    Q_RANGE = range(0, 2)
-    D       = 1
-    S       = 52       # weekly seasonality
+        self.order = order
 
-    def __init__(self):
-        self._models: dict = {}        # state → fitted SARIMAXResults
-        self._orders: dict = {}        # state → (p,d,q,P,D,Q)
+        self.seasonal_order = seasonal_order
 
-    # ── Fit ───────────────────────────────────────────────────────────────────
-    def fit(self, train: pd.DataFrame, state: str) -> None:
-        series = (
-            train[train["state"] == state]
-            .set_index("week_start_date")["sales"]
-            .asfreq("W-MON")
+        self.models = {}
+
+    # ── Train ───────────────────────────────────────────────────────────────
+    def fit(
+        self,
+        df: pd.DataFrame,
+        state: str,
+    ):
+
+        state_df = (
+            df[df["state"] == state]
+            .sort_values("week_start_date")
         )
 
-        best_aic, best_order, best_model = np.inf, None, None
+        series = state_df["sales"].values
 
-        for p, q in itertools.product(self.P_RANGE, self.Q_RANGE):
-            for P, Q in itertools.product(self.P_RANGE, self.Q_RANGE):
-                try:
-                    mdl = SARIMAX(
-                        series,
-                        order=(p, self.D, q),
-                        seasonal_order=(P, 1, Q, self.S),
-                        enforce_stationarity=False,
-                        enforce_invertibility=False,
-                    ).fit(disp=False)
+        model = SARIMAX(
+            series,
+            order=self.order,
+            seasonal_order=self.seasonal_order,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
 
-                    if mdl.aic < best_aic:
-                        best_aic   = mdl.aic
-                        best_order = (p, self.D, q, P, 1, Q)
-                        best_model = mdl
-                except Exception:
-                    continue
+        fitted_model = model.fit(disp=False)
 
-        if best_model is None:
-            # Fallback: simple ARIMA(1,1,1)
-            best_model = SARIMAX(series, order=(1, 1, 1)).fit(disp=False)
-            best_order = (1, 1, 1, 0, 0, 0)
+        self.models[state] = fitted_model
 
-        self._models[state] = best_model
-        self._orders[state] = best_order
-        logger.info(f"[SARIMA] {state}: best order {best_order}, AIC={best_aic:.1f}")
+    # ── Predict ────────────────────────────────────────────────────────────
+    def predict(
+        self,
+        horizon: int,
+        last_known: pd.DataFrame,
+        state: str,
+    ):
 
-    # ── Predict ───────────────────────────────────────────────────────────────
-    def predict(self, horizon: int, last_known: pd.DataFrame, state: str = None) -> np.ndarray:
-        if state is None:
-            raise ValueError("SARIMA.predict() requires `state` keyword argument.")
-        mdl = self._models[state]
-        fc  = mdl.get_forecast(steps=horizon)
-        return np.maximum(fc.predicted_mean.values, 0)
+        model = self.models.get(state)
 
-    def get_order(self, state: str) -> tuple:
-        return self._orders.get(state, None)
+        if model is None:
+            raise ValueError(
+                f"No trained SARIMA model found for {state}"
+            )
+
+        forecast = model.forecast(steps=horizon)
+
+        return np.array(forecast)
